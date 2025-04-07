@@ -18,6 +18,9 @@ config.read('config.ini')
 # Настройки из config.ini
 TOKEN = config.get('Telegram', 'token')
 ADMIN_IDS = set(map(int, config.get('Telegram', 'admin_ids').split(',')))
+# Добавляем настройки для группового чата и топика
+GROUP_CHAT_ID = config.get('Telegram', 'group_chat_id', fallback=None)
+TOPIC_ID = config.get('Telegram', 'topic_id', fallback=None)
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
@@ -139,6 +142,21 @@ async def get_next_task(message: Message, state: FSMContext):
 
     await message.answer("✅ Отчёт сохранён!", reply_markup=get_main_keyboard())
     await state.clear()
+    
+    # Отправляем отчет в топик группы, если настроено
+    if GROUP_CHAT_ID and TOPIC_ID:
+        report_text = f"📊 *Новый отчёт*\n\n👤 {user_name}\n🕒 {timestamp}\n✅ *Выполнено:* {completed_task}\n⏭ *Планы:* {next_task}"
+        try:
+            # Используем message_thread_id для отправки сообщения в конкретный топик
+            await bot.send_message(
+                chat_id=GROUP_CHAT_ID, 
+                text=report_text, 
+                message_thread_id=int(TOPIC_ID),
+                parse_mode="Markdown"
+            )
+            logging.info(f"Отчет от {user_name} отправлен в топик {TOPIC_ID} группы {GROUP_CHAT_ID}")
+        except Exception as e:
+            logging.error(f"Ошибка при отправке отчета в топик группы: {e}")
 
 # Просмотр всех отчётов (только для админов)
 @dp.message(lambda message: message.text == "📜 Просмотреть отчёты")
@@ -163,32 +181,99 @@ async def view_reports(message: Message):
     )
     await message.answer(response, reply_markup=get_main_keyboard())
 
-# Функция для отправки отчётов администраторам
+# Функция для отправки отчётов администраторам и в топик группы
 async def send_reports_to_admins():
+    # Получаем только отчеты за сегодняшний день
+    today = (datetime.now() + timedelta(hours=6)).strftime("%Y-%m-%d")
+    
     cursor.execute("""
         SELECT users.user_name, reports.completed_task, reports.next_task, reports.timestamp
         FROM reports
         JOIN users ON reports.user_id = users.user_id
+        WHERE reports.timestamp LIKE ?
         ORDER BY reports.timestamp DESC
-    """)
+    """, (f"{today}%",))
+    
     reports = cursor.fetchall()
     if not reports:
+        logging.info("Нет отчетов за сегодня")
         return
 
     response = "📜 Отчёты за сегодня:\n\n" + "\n\n".join(
         [f"👤 {r[0]}\n🕒 {r[3]}\n✅ {r[1]}\n⏭ {r[2]}" for r in reports]
     )
 
+    # Отправка отчетов администраторам в личку
     for admin_id in ADMIN_IDS:
         await bot.send_message(admin_id, response)
+    
+    # Отправка сводки отчетов в топик группы
+    if GROUP_CHAT_ID and TOPIC_ID:
+        try:
+            await bot.send_message(
+                chat_id=GROUP_CHAT_ID, 
+                text=f"📊 *Сводка отчетов*\n\n{response}", 
+                message_thread_id=int(TOPIC_ID),
+                parse_mode="Markdown"
+            )
+            logging.info(f"Сводка отчетов отправлена в топик {TOPIC_ID} группы {GROUP_CHAT_ID}")
+        except Exception as e:
+            logging.error(f"Ошибка при отправке сводки отчетов в топик группы: {e}")
 
-# Планирование отправки отчётов
+# Новая функция: Проверка, отправлял ли пользователь отчёт сегодня
+def has_user_reported_today(user_id):
+    # Получаем текущую дату в формате UTC+6
+    today = (datetime.now() + timedelta(hours=6)).strftime("%Y-%m-%d")
+    
+    cursor.execute("""
+        SELECT COUNT(*) FROM reports 
+        WHERE user_id = ? AND timestamp LIKE ?
+    """, (user_id, f"{today}%"))
+    
+    count = cursor.fetchone()[0]
+    return count > 0
+
+# Функция отправки утреннего напоминания пользователям
+async def send_morning_reminder():
+    cursor.execute("SELECT user_id, user_name FROM users")
+    users = cursor.fetchall()
+    
+    for user_id, user_name in users:
+        try:
+            message_text = f"Доброе утро, {user_name}! 🌞\nНе забудьте отправить утренний отчёт о планах на сегодня."
+            await bot.send_message(user_id, message_text, reply_markup=get_main_keyboard())
+            logging.info(f"Утреннее напоминание отправлено пользователю {user_name} (ID: {user_id})")
+        except Exception as e:
+            logging.error(f"Ошибка при отправке утреннего напоминания пользователю {user_id}: {e}")
+
+# Функция отправки вечернего напоминания пользователям, которые не отправили отчёт
+async def send_evening_reminder():
+    cursor.execute("SELECT user_id, user_name FROM users")
+    users = cursor.fetchall()
+    
+    for user_id, user_name in users:
+        if not has_user_reported_today(user_id):
+            try:
+                message_text = f"Добрый вечер, {user_name}! 🌙\nНе забудьте отправить отчёт о проделанной работе за сегодня."
+                await bot.send_message(user_id, message_text, reply_markup=get_main_keyboard())
+                logging.info(f"Вечернее напоминание отправлено пользователю {user_name} (ID: {user_id})")
+            except Exception as e:
+                logging.error(f"Ошибка при отправке вечернего напоминания пользователю {user_id}: {e}")
+
+# Планирование отправки отчётов и напоминаний
 def schedule_reports():
+    # Отправка отчётов администраторам и в топик группы
     # Отправка в 9:00 каждый будний день
     scheduler.add_job(send_reports_to_admins, 'cron', day_of_week='mon-fri', hour=9, minute=0)
     
     # Отправка в 17:30 каждый будний день
     scheduler.add_job(send_reports_to_admins, 'cron', day_of_week='mon-fri', hour=17, minute=30)
+    
+    # Утреннее напоминание пользователям (в 8:00 каждый будний день)
+    scheduler.add_job(send_morning_reminder, 'cron', day_of_week='mon-fri', hour=8, minute=0)
+    
+    # Вечернее напоминание пользователям (в 16:00 каждый будний день)
+    scheduler.add_job(send_evening_reminder, 'cron', day_of_week='mon-fri', hour=16, minute=0)
 
 # Функция запуска бота
 async def main():
