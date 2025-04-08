@@ -237,7 +237,6 @@ def has_user_reported_today(user_id):
 async def send_morning_reminder():
     cursor.execute("SELECT user_id, user_name FROM users")
     users = cursor.fetchall()
-    
     for user_id, user_name in users:
         try:
             message_text = f"Доброе утро, {user_name}! 🌞\nНе забудьте отправить утренний отчёт о планах на сегодня."
