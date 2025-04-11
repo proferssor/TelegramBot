@@ -398,6 +398,16 @@ async def view_reports_handler(message: Message, state: FSMContext):
             await message.answer("⛔ У вас нет прав для просмотра отчетов других пользователей.", reply_markup=get_main_keyboard(user_id))
 
 # --- ИЗМЕНЕННАЯ ФУНКЦИЯ ---
+def escape_markdown(text):
+    """Экранирует специальные символы Markdown в тексте."""
+    if not text:
+        return ""
+    # Экранируем символы, которые могут нарушить форматирование Markdown
+    special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    for char in special_chars:
+        text = text.replace(char, '\\' + char)
+    return text
+
 async def send_all_reports(message: Message):
     """Отправляет последние отчеты, сгруппированные по пользователям."""
     user_id = message.from_user.id
@@ -439,7 +449,10 @@ async def send_all_reports(message: Message):
                 grouped_reports[uname][date_str] = []
                 
             # Сохраняем отчет с временем для дальнейшей сортировки
-            grouped_reports[uname][date_str].append((completed_task, next_task, time_str, timestamp))
+            # Экранируем текст отчетов для избежания проблем с Markdown
+            safe_completed = escape_markdown(completed_task)
+            safe_next = escape_markdown(next_task)
+            grouped_reports[uname][date_str].append((safe_completed, safe_next, time_str, timestamp))
             processed_report_count += 1
 
         # --- ФОРМАТИРОВАНИЕ С ГРУППИРОВКОЙ ПО ДАТЕ ---
@@ -464,7 +477,7 @@ async def send_all_reports(message: Message):
                 user_dates_blocks.append(f"📅 *{date_str}*:\n{reports_text}")
             
             # Экранируем имя пользователя
-            safe_uname = uname.replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
+            safe_uname = escape_markdown(uname)
             user_block = f"👤 *{safe_uname}*:\n" + "\n\n".join(user_dates_blocks)
             user_blocks.append(user_block)
 
@@ -490,78 +503,27 @@ async def send_all_reports(message: Message):
         logging.error(f"Непредвиденная ошибка при отправке всех отчетов: {e}")
         await message.answer("❌ Произошла непредвиденная ошибка при получении отчетов.", reply_markup=get_main_keyboard(user_id))
 
-
 async def send_user_reports(message_or_callback: typing.Union[Message, CallbackQuery], target_user_id: int):
     """Отправляет отчеты конкретного пользователя. Может вызываться из Message или CallbackQuery."""
-    is_callback = isinstance(message_or_callback, CallbackQuery)
-    requesting_user_id = message_or_callback.from_user.id
-    reply_target = message_or_callback.message if is_callback else message_or_callback
-    keyboard_to_return = get_main_keyboard(requesting_user_id)
+    # ... другой код остается прежним ...
 
-    target_user_name = get_user_name(target_user_id)
-    if not target_user_name:
-        await reply_target.answer(f"❌ Пользователь с ID {target_user_id} не найден.", reply_markup=keyboard_to_return)
-        if is_callback: await message_or_callback.answer()
-        return
-
-    try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT completed_task, next_task, timestamp FROM reports WHERE user_id = ? ORDER BY timestamp DESC LIMIT 50", (target_user_id,))
-            reports = cursor.fetchall()
-        if not reports:
-            await reply_target.answer(f"📭 У пользователя {target_user_name} (ID: {target_user_id}) нет отчётов.", reply_markup=keyboard_to_return)
-            if is_callback: await message_or_callback.answer()
-            return
-
-        # --- ГРУППИРОВКА ПО ДАТЕ ---
-        grouped_reports: typing.Dict[str, typing.List[typing.Tuple[str, str, str]]] = {}
+    # --- ГРУППИРОВКА ПО ДАТЕ ---
+    grouped_reports: typing.Dict[str, typing.List[typing.Tuple[str, str, str]]] = {}
+    
+    for completed_task, next_task, timestamp in reports:
+        # Экранируем текст отчетов
+        safe_completed = escape_markdown(completed_task)
+        safe_next = escape_markdown(next_task)
         
-        for completed_task, next_task, timestamp in reports:
-            # Извлекаем дату и время из временной метки
-            date_str = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y")
-            time_str = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").strftime("%H:%M")
-            
-            if date_str not in grouped_reports:
-                grouped_reports[date_str] = []
-                
-            grouped_reports[date_str].append((completed_task, next_task, time_str))
+        # Извлекаем дату и время из временной метки
+        date_str = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y")
+        time_str = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").strftime("%H:%M")
         
-        # Форматирование с группировкой по дате
-        safe_target_name = target_user_name.replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
-        date_blocks = []
+        if date_str not in grouped_reports:
+            grouped_reports[date_str] = []
+            
+        grouped_reports[date_str].append((safe_completed, safe_next, time_str))
         
-        for date_str in sorted(grouped_reports.keys(), reverse=True):
-            date_reports = grouped_reports[date_str]
-            # Сортируем отчеты по времени в пределах даты (по убыванию)
-            date_reports.sort(key=lambda x: x[2], reverse=True)
-            
-            report_lines = [f"  🕒 *{time}*\n  ✅ {comp}\n  ⏭ {nxt}" for comp, nxt, time in date_reports]
-            date_blocks.append(f"📅 *{date_str}*\n\n" + "\n\n".join(report_lines))
-            
-        response = f"📜 *Отчёты {safe_target_name} (ID: {target_user_id}) (последние 50):*\n\n" + "\n\n".join(date_blocks)
-        # --- КОНЕЦ ФОРМАТИРОВАНИЯ ---
-
-        if is_callback:
-            await reply_target.edit_text("Отправка отчетов...")
-
-        for i in range(0, len(response), 4096):
-            await bot.send_message(reply_target.chat.id, response[i:i + 4096], parse_mode="Markdown", reply_markup=None)
-
-        await bot.send_message(reply_target.chat.id, f"--- Конец отчетов {safe_target_name} ---", reply_markup=keyboard_to_return)
-
-        if is_callback:
-            await message_or_callback.answer()
-
-    except Exception as e:
-        logging.error(f"Ошибка при отправке отчетов пользователя {target_user_id}: {e}")
-        error_message = "❌ Произошла ошибка при получении отчетов."
-        if is_callback:
-            await reply_target.edit_text(error_message)
-            await message_or_callback.answer("Произошла ошибка", show_alert=True)
-        else:
-            await reply_target.answer(error_message, reply_markup=keyboard_to_return)
-
 # (process_view_reports_callback без изменений)
 @dp.callback_query(F.data.startswith(CALLBACK_PREFIX_VIEW_REPORTS))
 async def process_view_reports_callback(callback: CallbackQuery):
