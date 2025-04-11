@@ -505,8 +505,6 @@ async def send_all_reports(message: Message):
 
 async def send_user_reports(message_or_callback: typing.Union[Message, CallbackQuery], target_user_id: int):
     """Отправляет отчеты конкретного пользователя. Может вызываться из Message или CallbackQuery."""
-    # ... другой код остается прежним ...
-
     # --- ГРУППИРОВКА ПО ДАТЕ ---
     grouped_reports: typing.Dict[str, typing.List[typing.Tuple[str, str, str]]] = {}
     
@@ -720,13 +718,259 @@ async def process_delete_user_callback(callback: CallbackQuery):
         except Exception as e:
             logging.error(f"Ошибка обновления клавиатуры удаления пользователя: {e}")
             await callback.answer("Не удалось обновить список.")
+# --- Функции напоминаний ---
+async def send_reminder_to_users():
+    """Отправляет напоминания пользователям о необходимости написать отчет"""
+    today = (datetime.now() + timedelta(hours=6)).strftime("%Y-%m-%d")
+    
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            # Получаем всех обычных пользователей
+            cursor.execute("SELECT user_id, user_name FROM users WHERE role = 'user'")
+            users = cursor.fetchall()
+            
+            # Проверяем, кто из них еще не отправил отчет сегодня
+            for user_id, user_name in users:
+                cursor.execute("SELECT COUNT(*) FROM reports WHERE user_id = ? AND timestamp LIKE ?", 
+                              (user_id, f"{today}%"))
+                if cursor.fetchone()[0] == 0:  # Если отчет еще не отправлен
+                    try:
+                        await bot.send_message(
+                            user_id,
+                            f"⏰ *Напоминание*\n\nПожалуйста, не забудьте отправить ежедневный отчет.",
+                            parse_mode="Markdown"
+                        )
+                        logging.info(f"Отправлено напоминание пользователю {user_name} (ID: {user_id})")
+                    except Exception as e:
+                        logging.error(f"Ошибка отправки напоминания пользователю {user_id}: {e}")
+    except Exception as e:
+        logging.error(f"Ошибка в функции напоминания: {e}")
 
-# --- Запуск бота ---
+async def send_daily_report_summary():
+    """Отправляет сводку отчетов за день администраторам и супер-админу"""
+    yesterday = (datetime.now() + timedelta(hours=6) - timedelta(days=1)).strftime("%Y-%m-%d")
+    today = (datetime.now() + timedelta(hours=6)).strftime("%Y-%m-%d")
+    
+    try:
+        # Собираем отчеты за предыдущий день
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT u.user_name, r.completed_task, r.next_task, r.timestamp
+                FROM reports r JOIN users u ON r.user_id = u.user_id
+                WHERE r.timestamp LIKE ?
+                ORDER BY r.timestamp DESC
+            """, (f"{yesterday}%",))
+            reports = cursor.fetchall()
+            
+            # Получаем пользователей, которые не отправили отчет
+            cursor.execute("""
+                SELECT user_id, user_name FROM users 
+                WHERE role = 'user' AND user_id NOT IN 
+                (SELECT user_id FROM reports WHERE timestamp LIKE ?)
+            """, (f"{yesterday}%",))
+            missing_users = cursor.fetchall()
+            
+        if not reports and not missing_users:
+            summary = f"📊 *Сводка отчетов за {yesterday}*\n\nНет данных для отображения."
+        else:
+            # Группировка отчетов по пользователям
+            user_reports = {}
+            for user_name, completed, next_task, timestamp in reports:
+                if user_name not in user_reports:
+                    user_reports[user_name] = []
+                user_reports[user_name].append((completed, next_task, timestamp))
+                
+            # Формируем текст сводки
+            summary = f"📊 *Сводка отчетов за {yesterday}*\n\n"
+            
+            if user_reports:
+                summary += "*Отправленные отчеты:*\n"
+                for user_name, user_data in user_reports.items():
+                    safe_name = escape_markdown(user_name)
+                    summary += f"👤 *{safe_name}*:\n"
+                    for completed, next_task, timestamp in user_data:
+                        time_str = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").strftime("%H:%M")
+                        safe_completed = escape_markdown(completed)
+                        safe_next = escape_markdown(next_task)
+                        summary += f"  🕒 {time_str}\n  ✅ {safe_completed}\n  ⏭ {safe_next}\n\n"
+            
+            if missing_users:
+                summary += "*Не отправили отчет:*\n"
+                for user_id, user_name in missing_users:
+                    safe_name = escape_markdown(user_name) if user_name else f"ID: {user_id}"
+                    summary += f"❌ {safe_name}\n"
+        
+        # Получаем список админов и супер-админа
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT user_id FROM users WHERE role IN ('admin', 'super_admin')")
+            admins = [admin_id[0] for admin_id in cursor.fetchall()]
+        
+        # Отправляем сводку всем админам
+        for admin_id in admins:
+            try:
+                # Отправляем сообщение частями, если оно слишком длинное
+                for i in range(0, len(summary), 4096):
+                    await bot.send_message(
+                        admin_id,
+                        summary[i:i + 4096],
+                        parse_mode="Markdown"
+                    )
+                logging.info(f"Отправлена ежедневная сводка админу {admin_id}")
+            except Exception as e:
+                logging.error(f"Ошибка отправки сводки админу {admin_id}: {e}")
+                
+    except Exception as e:
+        logging.error(f"Ошибка в функции отправки ежедневной сводки: {e}")
+async def send_daily_report_summary():
+    """Отправляет сводку отчетов за ТЕКУЩИЙ день администраторам и супер-админу"""
+    # Получаем текущее время в часовом поясе Бишкека (UTC+6)
+    now_bishkek = datetime.now() + timedelta(hours=6)
+    today = now_bishkek.strftime("%Y-%m-%d")
+    current_time_str = now_bishkek.strftime("%H:%M") # Текущее время для заголовка
+    logging.info(f"Generating daily summary for {today} at {current_time_str} Bishkek time.")
+
+    try:
+        reports = []
+        missing_users = []
+        admins = []
+
+        # Собираем отчеты за ТЕКУЩИЙ день
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            # Получаем отчеты
+            cursor.execute("""
+                SELECT u.user_name, r.completed_task, r.next_task, r.timestamp
+                FROM reports r JOIN users u ON r.user_id = u.user_id
+                WHERE r.timestamp LIKE ?
+                ORDER BY u.user_name, r.timestamp ASC /* Сортируем сразу по времени */
+            """, (f"{today}%",)) # Используем сегодняшнюю дату
+            reports = cursor.fetchall()
+            logging.info(f"Found {len(reports)} reports for today.")
+
+            # Получаем пользователей, которые НЕ отправили отчет СЕГОДНЯ
+            cursor.execute("""
+                SELECT user_id, user_name FROM users
+                WHERE role = 'user' AND user_id NOT IN
+                (SELECT user_id FROM reports WHERE timestamp LIKE ?)
+                ORDER BY user_name ASC
+            """, (f"{today}%",)) # Используем сегодняшнюю дату
+            missing_users = cursor.fetchall()
+            logging.info(f"Found {len(missing_users)} users who haven't reported today.")
+
+            # Получаем список админов и супер-админа
+            cursor.execute("SELECT user_id FROM users WHERE role IN ('admin', 'super_admin')")
+            admins = [admin_id[0] for admin_id in cursor.fetchall()]
+            logging.info(f"Found {len(admins)} admins/super_admins to send the summary to.")
+
+        if not reports and not missing_users:
+            summary = f"📊 *Сводка отчетов за {today} (на {current_time_str})*\n\nНа данный момент отчетов нет."
+        else:
+            # Группировка отчетов по пользователям (уже отсортированы по времени в SQL)
+            user_reports_grouped = {}
+            for user_name, completed, next_task, timestamp in reports:
+                if user_name not in user_reports_grouped:
+                    user_reports_grouped[user_name] = []
+                user_reports_grouped[user_name].append((completed, next_task, timestamp))
+
+            # Формируем текст сводки
+            summary_parts = [f"📊 *Сводка отчетов за {today} (на {current_time_str})*\n"] # Используем список для сборки
+
+            if user_reports_grouped:
+                summary_parts.append("\n*Отправленные отчеты:*\n")
+                for user_name, user_data in user_reports_grouped.items():
+                    safe_name = escape_markdown(user_name or "Имя не указано")
+                    summary_parts.append(f"👤 *{safe_name}*:")
+                    for completed, next_task, timestamp in user_data:
+                        # Извлекаем только время ЧЧ:ММ из полной метки времени
+                        try:
+                            time_str = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").strftime("%H:%M")
+                        except ValueError:
+                            time_str = "??:??" # Обработка некорректного формата времени
+                            logging.warning(f"Invalid timestamp format '{timestamp}' for user {user_name}")
+
+                        safe_completed = escape_markdown(completed or "-")
+                        safe_next = escape_markdown(next_task or "-")
+                        summary_parts.append(f"  🕒 {time_str}\n  ✅ {safe_completed}\n  ⏭ {safe_next}\n") # Добавляем \n в конце
+                    summary_parts.append("") # Пустая строка для разделения пользователей
+
+            if missing_users:
+                summary_parts.append("\n*Еще не отправили отчет:*\n")
+                missing_user_lines = []
+                for user_id, user_name in missing_users:
+                    safe_name = escape_markdown(user_name or f"ID: {user_id}")
+                    missing_user_lines.append(f"❌ {safe_name}")
+                summary_parts.append("\n".join(missing_user_lines))
+
+            summary = "\n".join(summary_parts) # Собираем итоговый текст
+
+        # Отправляем сводку всем админам
+        if not admins:
+            logging.warning("No admins found to send the summary.")
+            return
+
+        for admin_id in admins:
+            try:
+                # Отправляем сообщение частями, если оно слишком длинное (лимит Telegram 4096)
+                if len(summary) == 0:
+                    logging.info(f"Summary for admin {admin_id} is empty, not sending.")
+                    continue
+
+                for i in range(0, len(summary), 4096):
+                    part = summary[i:i + 4096]
+                    await bot.send_message(
+                        admin_id,
+                        part,
+                        parse_mode="Markdown"
+                    )
+                logging.info(f"Daily summary sent successfully to admin {admin_id} at {current_time_str}")
+            except Exception as e:
+                 # Обработка конкретных ошибок API Telegram
+                logging.error(f"Error sending summary to admin {admin_id}: {e}")
+
+    except Exception as e:
+        logging.error(f"Database or other error in daily summary function: {e}")
+
+# --- Настройка и запуск планировщика ---
+def setup_scheduler():
+    """Настраивает планировщик задач"""
+    logging.info("Setting up scheduler jobs...")
+    try:
+        # Напоминание в 17:00 (Бишкек = UTC+6, значит 11:00 UTC)
+        scheduler.add_job(send_reminder_to_users, 'cron', hour=11, minute=0, timezone='UTC')
+        logging.info("Scheduled reminder job for 11:00 UTC (17:00 Bishkek).")
+
+        # Ежедневная сводка в 10:00 (Бишкек = UTC+6, значит 04:00 UTC)
+        scheduler.add_job(send_daily_report_summary, 'cron', hour=4, minute=0, timezone='UTC')
+        logging.info("Scheduled summary job for 04:00 UTC (10:00 Bishkek).")
+
+        # Ежедневная сводка в 18:00 (Бишкек = UTC+6, значит 12:00 UTC)
+        scheduler.add_job(send_daily_report_summary, 'cron', hour=12, minute=0, timezone='UTC')
+        logging.info("Scheduled summary job for 12:00 UTC (18:00 Bishkek).")
+
+        # Запускаем планировщик (если он еще не запущен)
+        if not scheduler.running:
+            scheduler.start()
+            logging.info("Task scheduler started successfully.")
+        else:
+            logging.info("Scheduler is already running.")
+
+    except Exception as e:
+        logging.error(f"Failed to setup or start scheduler: {e}", exc_info=True) # Добавим traceback
+        # Возможно, стоит предпринять дополнительные действия, например, выйти из приложения
+
+# --- Обновление функции main для запуска планировщика ---
 async def main():
     try:
+        # Запускаем планировщик
+        setup_scheduler()
+        # Запускаем бота
         await dp.start_polling(bot)
     finally:
+        # Останавливаем планировщик при завершении работы
+        scheduler.shutdown()
         await bot.session.close()
-
 if __name__ == '__main__':
     asyncio.run(main())
