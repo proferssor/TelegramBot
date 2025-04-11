@@ -419,38 +419,57 @@ async def send_all_reports(message: Message):
             await message.answer("📭 Отчётов пока нет.", reply_markup=get_main_keyboard(user_id))
             return
 
-        # --- ЛОГИКА ГРУППИРОВКИ (как в send_daily_summary) ---
-        grouped_reports: typing.Dict[str, typing.List[typing.Tuple[str, str, str]]] = {} # Используем typing.Dict и т.д.
+        # --- ЛОГИКА ГРУППИРОВКИ С УЧЕТОМ ДАТЫ ---
+        grouped_reports: typing.Dict[str, typing.Dict[str, typing.List[typing.Tuple[str, str, str]]]] = {}
         processed_report_count = 0
+        
         for user_name, completed_task, next_task, timestamp in reports:
             # Используем имя пользователя как ключ
-            uname = user_name if user_name else f"User_ID_{timestamp.split('-')[0]}" # Обработка случая без имени
+            uname = user_name if user_name else f"User_ID_{timestamp.split('-')[0]}"
+            
             if uname not in grouped_reports:
-                grouped_reports[uname] = []
-            # Преобразуем timestamp в H:M формат для отображения
-            time_str = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").strftime("%d.%m %H:%M") # Добавим дату для ясности
-            grouped_reports[uname].append((completed_task, next_task, time_str))
+                grouped_reports[uname] = {}
+                
+            # Извлекаем дату из timestamp для группировки по дате
+            date_obj = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+            date_str = date_obj.strftime("%d.%m.%Y")
+            time_str = date_obj.strftime("%H:%M")
+            
+            if date_str not in grouped_reports[uname]:
+                grouped_reports[uname][date_str] = []
+                
+            # Сохраняем отчет с временем для дальнейшей сортировки
+            grouped_reports[uname][date_str].append((completed_task, next_task, time_str, timestamp))
             processed_report_count += 1
 
-
-        # --- ФОРМАТИРОВАНИЕ С ГРУППИРОВКОЙ ---
+        # --- ФОРМАТИРОВАНИЕ С ГРУППИРОВКОЙ ПО ДАТЕ ---
         user_blocks = []
+        
         # Сортируем пользователей по имени для стабильного порядка
         for uname in sorted(grouped_reports.keys()):
-            u_reports = grouped_reports[uname]
-            # Форматируем отчеты одного пользователя, разделяя их ОДНИМ переносом строки
-            # Отчеты уже отсортированы по времени DESC из-за ORDER BY в SQL
-            reports_text = "\n".join(
-                [f"  🕒 {t}\n  ✅ {comp}\n  ⏭ {nxt}" for comp, nxt, t in u_reports]
-            )
+            user_dates = grouped_reports[uname]
+            user_dates_blocks = []
+            
+            # Для каждого пользователя обрабатываем все даты
+            for date_str in sorted(user_dates.keys(), key=lambda d: datetime.strptime(d, "%d.%m.%Y"), reverse=True):
+                date_reports = user_dates[date_str]
+                
+                # Сортируем отчеты в пределах даты по исходному timestamp (по убыванию = новые сверху)
+                date_reports.sort(key=lambda r: r[3], reverse=True)
+                
+                # Форматируем отчеты одной даты
+                reports_text = "\n".join(
+                    [f"  🕒 {t}\n  ✅ {comp}\n  ⏭ {nxt}" for comp, nxt, t, _ in date_reports]
+                )
+                user_dates_blocks.append(f"📅 *{date_str}*:\n{reports_text}")
+            
             # Экранируем имя пользователя
             safe_uname = uname.replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
-            user_blocks.append(f"👤 *{safe_uname}*:\n{reports_text}")
+            user_block = f"👤 *{safe_uname}*:\n" + "\n\n".join(user_dates_blocks)
+            user_blocks.append(user_block)
 
         # Собираем итоговый текст, разделяя блоки пользователей ДВУМЯ переносами строки
         response = f"📜 *Последние {processed_report_count} отчётов (сгруппировано по пользователям):*\n\n" + "\n\n".join(user_blocks)
-        # --- КОНЕЦ ФОРМАТИРОВАНИЯ ---
-
 
         # Отправка сообщения (возможно, частями)
         for i in range(0, len(response), 4096):
@@ -464,18 +483,15 @@ async def send_all_reports(message: Message):
         elif not response: # Если response пустой (маловероятно, но все же)
             await message.answer("Не удалось сформировать список отчетов.", reply_markup=get_main_keyboard(user_id))
 
-
     except sqlite3.Error as e:
         logging.error(f"Ошибка БД при получении всех отчетов: {e}")
         await message.answer("❌ Произошла ошибка базы данных при получении отчетов.", reply_markup=get_main_keyboard(user_id))
     except Exception as e:
         logging.error(f"Непредвиденная ошибка при отправке всех отчетов: {e}")
         await message.answer("❌ Произошла непредвиденная ошибка при получении отчетов.", reply_markup=get_main_keyboard(user_id))
-# --- КОНЕЦ ИЗМЕНЕННОЙ ФУНКЦИИ ---
 
 
-# (send_user_reports без изменений)
-async def send_user_reports(message_or_callback: typing.Union[Message, CallbackQuery], target_user_id: int): # Используем typing.Union
+async def send_user_reports(message_or_callback: typing.Union[Message, CallbackQuery], target_user_id: int):
     """Отправляет отчеты конкретного пользователя. Может вызываться из Message или CallbackQuery."""
     is_callback = isinstance(message_or_callback, CallbackQuery)
     requesting_user_id = message_or_callback.from_user.id
@@ -498,9 +514,33 @@ async def send_user_reports(message_or_callback: typing.Union[Message, CallbackQ
             if is_callback: await message_or_callback.answer()
             return
 
+        # --- ГРУППИРОВКА ПО ДАТЕ ---
+        grouped_reports: typing.Dict[str, typing.List[typing.Tuple[str, str, str]]] = {}
+        
+        for completed_task, next_task, timestamp in reports:
+            # Извлекаем дату и время из временной метки
+            date_str = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y")
+            time_str = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").strftime("%H:%M")
+            
+            if date_str not in grouped_reports:
+                grouped_reports[date_str] = []
+                
+            grouped_reports[date_str].append((completed_task, next_task, time_str))
+        
+        # Форматирование с группировкой по дате
         safe_target_name = target_user_name.replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
-        report_lines = [f"🕒 *{ts}*\n✅ {comp}\n⏭ {nxt}" for comp, nxt, ts in reports]
-        response = f"📜 *Отчёты {safe_target_name} (ID: {target_user_id}) (последние 50):*\n\n" + "\n\n".join(report_lines)
+        date_blocks = []
+        
+        for date_str in sorted(grouped_reports.keys(), reverse=True):
+            date_reports = grouped_reports[date_str]
+            # Сортируем отчеты по времени в пределах даты (по убыванию)
+            date_reports.sort(key=lambda x: x[2], reverse=True)
+            
+            report_lines = [f"  🕒 *{time}*\n  ✅ {comp}\n  ⏭ {nxt}" for comp, nxt, time in date_reports]
+            date_blocks.append(f"📅 *{date_str}*\n\n" + "\n\n".join(report_lines))
+            
+        response = f"📜 *Отчёты {safe_target_name} (ID: {target_user_id}) (последние 50):*\n\n" + "\n\n".join(date_blocks)
+        # --- КОНЕЦ ФОРМАТИРОВАНИЯ ---
 
         if is_callback:
             await reply_target.edit_text("Отправка отчетов...")
@@ -521,7 +561,6 @@ async def send_user_reports(message_or_callback: typing.Union[Message, CallbackQ
             await message_or_callback.answer("Произошла ошибка", show_alert=True)
         else:
             await reply_target.answer(error_message, reply_markup=keyboard_to_return)
-
 
 # (process_view_reports_callback без изменений)
 @dp.callback_query(F.data.startswith(CALLBACK_PREFIX_VIEW_REPORTS))
@@ -574,8 +613,6 @@ async def process_view_reports_callback(callback: CallbackQuery):
         except Exception as e:
             logging.error(f"Ошибка обновления клавиатуры просмотра отчетов: {e}")
             await callback.answer("Не удалось обновить список.")
-
-
 # --- Администрирование (Выбор из списка) ---
 # (add_admin_start, remove_admin_start, process_add_admin_callback, process_remove_admin_callback без изменений)
 @dp.message(F.text == "➕ Добавить админа")
